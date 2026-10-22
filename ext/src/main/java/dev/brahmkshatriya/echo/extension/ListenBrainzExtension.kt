@@ -16,7 +16,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 
-private fun lbLog(msg: String) = println("LbExt: $msg")
+private fun lbLog(msg: String) = println("LbExt: $msg ")
 
 class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput {
 
