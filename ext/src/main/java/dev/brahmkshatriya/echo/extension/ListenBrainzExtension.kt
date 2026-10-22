@@ -8,58 +8,85 @@ import dev.brahmkshatriya.echo.common.settings.Setting
 import dev.brahmkshatriya.echo.common.settings.SettingSwitch
 import dev.brahmkshatriya.echo.common.settings.SettingTextInput
 import dev.brahmkshatriya.echo.common.settings.Settings
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import java.io.File
 
-private fun lbLog(msg: String) = println("LbExt: $msg ")
+private fun lbLog(msg: String) = println("LbExt: $msg")
 
 class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput {
 
     companion object {
         const val KEY_API_URL = "api_url"
         const val KEY_NOW_PLAYING = "now_playing"
-        const val DEFAULT_API_URL = "https://api.listenbrainz.org"
-
         const val KEY_MIN_SECONDS = "min_seconds"
+        const val KEY_OFFLINE_QUEUE = "offline_queue"
+        const val DEFAULT_API_URL = "https://api.listenbrainz.org"
+        private const val MAX_QUEUE = 2000
+        private const val BATCH = 100
     }
+
+    private enum class SendResult { OK, RETRY, DROP }
 
     private lateinit var settings: Settings
     private val http = OkHttpClient()
     private val json = Json { ignoreUnknownKeys = true }
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private var currentUser: User? = null
     private var token: String? = null
 
+    // ascolto in corso
     private var currentKey: String? = null
     private var startedAtSec = 0L
     private var wasPlaying = false
     private var nowPlayingKey: String? = null
+    private var scheduledKey: String? = null
+    private var nowPlayingJob: Job? = null
 
-    // --- Settings ---
+    // coda offline
+    private val queueMutex = Mutex()
+    private val pending = mutableListOf<JsonObject>()
+    private var queueOwner: String? = null
+    private val queueFile: File by lazy {
+        val dir = File(System.getProperty("java.io.tmpdir") ?: ".", "listenbrainz_ext")
+        dir.mkdirs()
+        File(dir, "pending.json")
+    }
+
+    // --- Impostazioni ---
 
     override suspend fun getSettingItems(): List<Setting> = listOf(
         SettingSwitch("Send \"now playing\"", KEY_NOW_PLAYING, "Show the current track on your ListenBrainz profile", true),
-        SettingTextInput("API URL", KEY_API_URL, "Change only for compatible servers (self-hosted, Libre.fm...)", DEFAULT_API_URL),
+        SettingSwitch("Offline queue", KEY_OFFLINE_QUEUE, "Keep listens when offline and send them later", true),
         SettingTextInput(
             "Minimum listening time (seconds)", KEY_MIN_SECONDS,
-            "Nothing is sent to ListenBrainz until the track has played this long (0 = no extra limit)", "0"
-        )
+            "Nothing is sent until the track has played this long (0 = no extra limit)", "0"
+        ),
+        SettingTextInput("API URL", KEY_API_URL, "Change only for compatible servers (self-hosted, Libre.fm...)", DEFAULT_API_URL)
     )
 
     override fun setSettings(settings: Settings) { this.settings = settings }
 
     private fun apiRoot() = settings.getString(KEY_API_URL)?.trim()?.trimEnd('/')?.ifEmpty { null } ?: DEFAULT_API_URL
-
+    private fun nowPlayingEnabled() = settings.getBoolean(KEY_NOW_PLAYING) ?: true
+    private fun offlineQueueEnabled() = settings.getBoolean(KEY_OFFLINE_QUEUE) ?: true
     private fun minPlayMs(): Long =
         (settings.getString(KEY_MIN_SECONDS)?.trim()?.toIntOrNull() ?: 0).coerceIn(0, 600) * 1000L
-    private fun nowPlayingEnabled() = settings.getBoolean(KEY_NOW_PLAYING) ?: true
 
-    // --- Login ---
+    // --- Login: token utente ---
 
     override val forms = listOf(
         LoginClient.Form(
@@ -78,7 +105,7 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput {
         val req = Request.Builder().url(apiRoot() + "/1/validate-token")
             .header("Authorization", "Token $t").get().build()
         val body = withContext(Dispatchers.IO) {
-            http.newCall(req).execute().use { it.body.string() }
+            http.newCall(req).execute().use { it.body?.string().orEmpty() }
         }
         val o = runCatching { json.parseToJsonElement(body).jsonObject }.getOrNull()
         if (o?.get("valid")?.jsonPrimitive?.booleanOrNull != true) error("Invalid ListenBrainz token")
@@ -89,6 +116,7 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput {
     override fun setLoginUser(user: User?) {
         currentUser = user
         token = user?.extras?.get("token")
+        if (token != null) scope.launch { flushQueue() }
     }
 
     override suspend fun getCurrentUser(): User? = currentUser?.copy(extras = emptyMap())
@@ -106,18 +134,39 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput {
     }
 
     override suspend fun onTrackChanged(details: TrackDetails?) {
-        if (details == null) { currentKey = null; wasPlaying = false; return }
+        if (details == null) {
+            currentKey = null
+            wasPlaying = false
+            nowPlayingJob?.cancel()
+            scheduledKey = null
+            return
+        }
         ensureTrack(details)
+        scope.launch { flushQueue() } // approfitta del cambio brano per svuotare la coda
     }
 
     override suspend fun onPlayingStateChanged(details: TrackDetails?, isPlaying: Boolean) {
-        if (details == null) { wasPlaying = false; return }
+        if (details == null) {
+            nowPlayingJob?.cancel()
+            scheduledKey = null
+            wasPlaying = false
+            return
+        }
         ensureTrack(details)
         val k = keyOf(details)
-        val unlocked = details.currentPosition >= minPlayMs()
-        if (isPlaying && unlocked && (!wasPlaying || nowPlayingKey != k) && nowPlayingEnabled()) {
-            nowPlayingKey = k
-            submit("playing_now", details, null)
+        if (!isPlaying) {
+            nowPlayingJob?.cancel()
+            scheduledKey = null
+        } else if ((!wasPlaying || nowPlayingKey != k) && scheduledKey != k && nowPlayingEnabled()) {
+            // "now playing" dopo la soglia: un timer, non dipende dagli aggiornamenti di posizione
+            nowPlayingJob?.cancel()
+            scheduledKey = k
+            val wait = (minPlayMs() - details.currentPosition).coerceAtLeast(0L)
+            nowPlayingJob = scope.launch {
+                if (wait > 0) delay(wait)
+                nowPlayingKey = k
+                sendNowPlaying(details)
+            }
         }
         wasPlaying = isPlaying
     }
@@ -126,20 +175,35 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput {
         val total = details.totalDuration ?: details.track.duration
         if (total != null && total < 30_000) return null
         val rule = minOf(total?.div(2) ?: 120_000L, 240_000L)
-        return minPlayMs().takeIf { it > 0 } ?: rule
+        return maxOf(rule, minPlayMs())
     }
 
     override suspend fun onMarkAsPlayed(details: TrackDetails) {
         ensureTrack(details)
-        submit("single", details, startedAtSec)
+        val meta = trackMetadata(details) ?: run {
+            lbLog("saltato (mancano artista o titolo): ${details.track.title}")
+            return
+        }
+        val listen = listenObject(meta, startedAtSec)
+        if (offlineQueueEnabled()) {
+            queueMutex.withLock {
+                ensureQueueLoaded()
+                pending.add(listen)
+                while (pending.size > MAX_QUEUE) pending.removeAt(0)
+                saveQueue()
+            }
+            flushQueue()
+        } else {
+            post("single", listOf(listen))
+        }
     }
 
-    // --- Sending to ListenBrainz ---
+    // --- Costruzione dei dati ---
 
     private fun trackMetadata(d: TrackDetails): JsonObject? {
         val t = d.track
         val artist = t.artists.joinToString(", ") { it.name }.trim()
-        if (artist.isEmpty() || t.title.isBlank()) return null // artist_name & track_name
+        if (artist.isEmpty() || t.title.isBlank()) return null
         return buildJsonObject {
             put("artist_name", artist)
             put("track_name", t.title)
@@ -154,34 +218,94 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput {
         }
     }
 
-    private suspend fun submit(type: String, d: TrackDetails, listenedAt: Long?) {
-        val tk = token ?: return
-        val meta = trackMetadata(d) ?: run {
-            lbLog("Skipped: ${d.track.title}")
-            return
+    private fun listenObject(meta: JsonObject, listenedAt: Long?) = buildJsonObject {
+        listenedAt?.let { put("listened_at", it) }
+        put("track_metadata", meta)
+    }
+
+    private suspend fun sendNowPlaying(d: TrackDetails) {
+        val meta = trackMetadata(d) ?: return
+        post("playing_now", listOf(listenObject(meta, null)))
+    }
+
+    // --- Offline ---
+
+    private fun ensureQueueLoaded() {
+        val owner = currentUser?.id
+        if (owner != null && queueOwner == owner) return
+        queueOwner = owner
+        pending.clear()
+        if (owner == null) return
+        try {
+            if (!queueFile.exists()) return
+            val o = json.parseToJsonElement(queueFile.readText()).jsonObject
+            if (o["owner"]?.jsonPrimitive?.contentOrNull != owner) return
+            (o["listens"] as? JsonArray)?.forEach { (it as? JsonObject)?.let(pending::add) }
+        } catch (e: Exception) {
+            lbLog("coda illeggibile: ${e.message}")
         }
+    }
+
+    private fun saveQueue() {
+        try {
+            val owner = queueOwner ?: return
+            if (pending.isEmpty()) { queueFile.delete(); return }
+            queueFile.writeText(
+                buildJsonObject {
+                    put("owner", owner)
+                    put("listens", JsonArray(pending))
+                }.toString()
+            )
+        } catch (e: Exception) {
+            lbLog("coda non salvata: ${e.message}")
+        }
+    }
+
+    private suspend fun flushQueue() {
+        queueMutex.withLock {
+            if (token == null) return@withLock
+            ensureQueueLoaded()
+            while (pending.isNotEmpty()) {
+                val batch = pending.take(BATCH)
+                val type = if (batch.size == 1) "single" else "import"
+                when (post(type, batch)) {
+                    SendResult.RETRY -> return@withLock
+                    else -> { // OK o DROP: in entrambi i casi quei brani escono dalla coda
+                        repeat(batch.size) { pending.removeAt(0) }
+                        saveQueue()
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Rete ---
+
+    private suspend fun post(type: String, listens: List<JsonObject>): SendResult {
+        val tk = token ?: return SendResult.RETRY
         val body = buildJsonObject {
             put("listen_type", type)
-            putJsonArray("payload") {
-                add(buildJsonObject {
-                    listenedAt?.let { put("listened_at", it) }
-                    put("track_metadata", meta)
-                })
-            }
+            put("payload", JsonArray(listens))
         }
         val req = Request.Builder().url(apiRoot() + "/1/submit-listens")
             .header("Authorization", "Token $tk")
             .post(body.toString().toRequestBody("application/json".toMediaType()))
             .build()
-        try {
+        return try {
             withContext(Dispatchers.IO) {
                 http.newCall(req).execute().use { res ->
-                    if (!res.isSuccessful) lbLog("$type failed: HTTP ${res.code} ${res.body.string()}")
-                    else lbLog("$type sent: ${d.track.title}")
+                    when {
+                        res.isSuccessful -> { lbLog("$type inviato (${listens.size})"); SendResult.OK }
+                        res.code == 401 || res.code == 429 || res.code >= 500 -> {
+                            lbLog("$type da ritentare: HTTP ${res.code}"); SendResult.RETRY
+                        }
+                        else -> { lbLog("$type scartato: HTTP ${res.code} ${res.body?.string()}"); SendResult.DROP }
+                    }
                 }
             }
         } catch (e: Exception) {
-            lbLog("$type error: ${e.message}")
+            lbLog("$type errore di rete: ${e.message}")
+            SendResult.RETRY
         }
     }
 }
