@@ -43,6 +43,9 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput, LikeCl
         const val KEY_DEDUP_WINDOW = "dedup_window"
 
         const val KEY_AUTO_LOVE = "auto_love"
+
+        const val KEY_PRIVATE = "private"
+
     }
 
     private enum class SendResult { OK, RETRY, DROP }
@@ -94,6 +97,10 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput, LikeCl
             "Auto-love listened tracks", KEY_AUTO_LOVE,
             "Every track counted as listened is also marked as loved on ListenBrainz", false
         ),
+        SettingSwitch(
+            "Auto-private listened tracks", KEY_PRIVATE,
+            "Every track counted as listened is marked as private on ListenBrainz", false
+        ),
         SettingTextInput("API URL", KEY_API_URL, "Change only for compatible servers (self-hosted, Libre.fm...)", DEFAULT_API_URL)
     )
 
@@ -109,6 +116,9 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput, LikeCl
         (settings.getString(KEY_NOW_PLAYING_DELAY)?.trim()?.toIntOrNull() ?: 0).coerceIn(0, 600) * 1000L
 
     private fun autoLoveEnabled() = settings.getBoolean(KEY_AUTO_LOVE) ?: false
+
+    private fun autoPrivateEnabled() = settings.getBoolean(KEY_AUTO_LOVE) ?: false
+
 
     // --- Login---
 
@@ -212,7 +222,7 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput, LikeCl
             lbLog("skipped, missing data: ${details.track.title}")
             return
         }
-        val listen = listenObject(meta, startedAtSec)
+        val listen = listenObject(meta, startedAtSec, true)
         if (offlineQueueEnabled()) {
             queueMutex.withLock {
                 ensureQueueLoaded()
@@ -248,14 +258,15 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput, LikeCl
         }
     }
 
-    private fun listenObject(meta: JsonObject, listenedAt: Long?) = buildJsonObject {
+    private fun listenObject(meta: JsonObject, listenedAt: Long?, isNowPlaying: Boolean) = buildJsonObject {
         listenedAt?.let { put("listened_at", it) }
         put("track_metadata", meta)
+        if (autoPrivateEnabled() && !isNowPlaying) put("private", true)
     }
 
     private suspend fun sendNowPlaying(d: TrackDetails) {
         val meta = trackMetadata(d) ?: return
-        post("playing_now", listOf(listenObject(meta, null)))
+        post("playing_now", listOf(listenObject(meta, null, false)))
     }
 
     private val recentPlays = ArrayDeque<String>()
