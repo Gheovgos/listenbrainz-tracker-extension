@@ -1,7 +1,9 @@
 package dev.brahmkshatriya.echo.extension
 
+import dev.brahmkshatriya.echo.common.clients.LikeClient
 import dev.brahmkshatriya.echo.common.clients.LoginClient
 import dev.brahmkshatriya.echo.common.clients.TrackerMarkClient
+import dev.brahmkshatriya.echo.common.models.EchoMediaItem
 import dev.brahmkshatriya.echo.common.models.TrackDetails
 import dev.brahmkshatriya.echo.common.models.User
 import dev.brahmkshatriya.echo.common.settings.Setting
@@ -23,20 +25,24 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
+import okhttp3.HttpUrl.Companion.toHttpUrl
 
 private fun lbLog(msg: String) = println("LbExt: $msg")
 
-class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput {
+class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput, LikeClient {
 
     companion object {
         const val KEY_API_URL = "api_url"
-        const val KEY_NOW_PLAYING = "now_playing"
+        const val KEY_PLAYED = "played"
+        const val KEY_NOW_PLAYING_DELAY = "now_playing_delay"
         const val KEY_MIN_SECONDS = "min_seconds"
         const val KEY_OFFLINE_QUEUE = "offline_queue"
         const val DEFAULT_API_URL = "https://api.listenbrainz.org"
         private const val MAX_QUEUE = 2000
         private const val BATCH = 100
         const val KEY_DEDUP_WINDOW = "dedup_window"
+
+        const val KEY_AUTO_LOVE = "auto_love"
     }
 
     private enum class SendResult { OK, RETRY, DROP }
@@ -70,7 +76,11 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput {
     // --- Settings ---
 
     override suspend fun getSettingItems(): List<Setting> = listOf(
-        SettingSwitch("Send \"now playing\"", KEY_NOW_PLAYING, "Show the current track on your ListenBrainz profile", true),
+        SettingTextInput(
+            "Now playing delay (seconds)", KEY_NOW_PLAYING_DELAY,
+            "Show the track on your profile after this many seconds (0 = immediately)", "0"
+        ),
+        SettingSwitch("Send \"Played\"", KEY_PLAYED, "Show the current track marked as \"Listen\" on your ListenBrainz profile", true),
         SettingSwitch("Offline queue", KEY_OFFLINE_QUEUE, "Keep listens when offline and send them later", true),
         SettingTextInput(
             "Listen threshold (seconds)", KEY_MIN_SECONDS,
@@ -80,16 +90,25 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput {
             "Hide repeats within N tracks", KEY_DEDUP_WINDOW,
             "If the same track was played in the last N plays, don't submit it (0 = off)", "0"
         ),
+        SettingSwitch(
+            "Auto-love listened tracks", KEY_AUTO_LOVE,
+            "Every track counted as listened is also marked as loved on ListenBrainz", false
+        ),
         SettingTextInput("API URL", KEY_API_URL, "Change only for compatible servers (self-hosted, Libre.fm...)", DEFAULT_API_URL)
     )
 
     override fun setSettings(settings: Settings) { this.settings = settings }
 
     private fun apiRoot() = settings.getString(KEY_API_URL)?.trim()?.trimEnd('/')?.ifEmpty { null } ?: DEFAULT_API_URL
-    private fun nowPlayingEnabled() = settings.getBoolean(KEY_NOW_PLAYING) ?: true
+    private fun nowPlayingEnabled() = settings.getBoolean(KEY_PLAYED) ?: true
     private fun offlineQueueEnabled() = settings.getBoolean(KEY_OFFLINE_QUEUE) ?: true
     private fun minPlayMs(): Long =
         (settings.getString(KEY_MIN_SECONDS)?.trim()?.toIntOrNull() ?: 0).coerceIn(0, 600) * 1000L
+
+    private fun nowPlayingDelayMs(): Long =
+        (settings.getString(KEY_NOW_PLAYING_DELAY)?.trim()?.toIntOrNull() ?: 0).coerceIn(0, 600) * 1000L
+
+    private fun autoLoveEnabled() = settings.getBoolean(KEY_AUTO_LOVE) ?: false
 
     // --- Login---
 
@@ -165,7 +184,7 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput {
         } else if ((!wasPlaying || nowPlayingKey != k) && scheduledKey != k && nowPlayingEnabled()) {
             nowPlayingJob?.cancel()
             scheduledKey = k
-            val wait = (minPlayMs() - details.currentPosition).coerceAtLeast(0L)
+            val wait = (nowPlayingDelayMs() - details.currentPosition).coerceAtLeast(0L)
             nowPlayingJob = scope.launch {
                 if (wait > 0) delay(wait)
                 nowPlayingKey = k
@@ -205,6 +224,8 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput {
         } else {
             post("single", listOf(listen))
         }
+        lbLog("onMarkAsPlayed: autolove=${autoLoveEnabled()} token=${token != null}")
+        if (autoLoveEnabled()) scope.launch { autoLove(details) }
     }
 
     // --- Costruzione dei dati ---
@@ -308,6 +329,70 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput {
             }
         }
     }
+    override suspend fun likeItem(item: EchoMediaItem, shouldLike: Boolean) {
+        lbLog("likeItem received: ${item.title} -> $shouldLike")
+    }
+    override suspend fun isItemLiked(item: EchoMediaItem): Boolean = false
+    private val lovedMbids = mutableSetOf<String>()
+
+    private suspend fun lookupMbid(d: TrackDetails): String? {
+        d.track.extras["mbid"]?.takeIf { it.isNotBlank() }?.let { return it }
+
+        val names = d.track.artists.map { it.name }.filter { it.isNotBlank() }
+        val candidates = listOfNotNull(names.joinToString(", ").ifEmpty { null }, names.firstOrNull()).distinct()
+        if (candidates.isEmpty() || d.track.title.isBlank()) return null
+
+        for (artist in candidates) {
+            val url = (apiRoot() + "/1/metadata/lookup/").toHttpUrl().newBuilder()
+                .addQueryParameter("artist_name", artist)
+                .addQueryParameter("recording_name", d.track.title)
+                .build()
+            val body = try {
+                withContext(Dispatchers.IO) {
+                    http.newCall(Request.Builder().url(url).header("Authorization", "Token ${token.orEmpty()}").get().build()).execute().use {
+                        val b = if (it.isSuccessful) it.body.string() else null
+                        lbLog("lookup HTTP ${it.code} per '$artist' - '${d.track.title}': ${b?.take(300)}")
+                        b
+                    }
+                }
+            } catch (e: Exception) {
+                lbLog("lookup errore: ${e.message}")
+                null
+            } ?: continue
+            val mbid = runCatching {
+                json.parseToJsonElement(body).jsonObject["recording_mbid"]?.jsonPrimitive?.contentOrNull
+            }.getOrNull()
+            if (!mbid.isNullOrBlank()) return mbid
+        }
+        return null
+    }
+
+    private suspend fun autoLove(d: TrackDetails) {
+        lbLog("autolove: ${d.track.artists.joinToString { it.name }} - ${d.track.title}")
+        val tk = token ?: return
+        val mbid = lookupMbid(d) ?: run {
+            lbLog("love skipped (no MBID): ${d.track.title}")
+            return
+        }
+        if (!synchronized(lovedMbids) { lovedMbids.add(mbid) }) return
+
+        val body = buildJsonObject { put("recording_mbid", mbid); put("score", 1) }
+        val req = Request.Builder().url(apiRoot() + "/1/feedback/recording-feedback")
+            .header("Authorization", "Token $tk")
+            .post(body.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        try {
+            withContext(Dispatchers.IO) {
+                http.newCall(req).execute().use { res ->
+                    if (res.isSuccessful) lbLog("love sent: $mbid")
+                    else { lbLog("love fallito: HTTP ${res.code}"); synchronized(lovedMbids) { lovedMbids.remove(mbid) } }
+                }
+            }
+        } catch (e: Exception) {
+            lbLog("love errore di rete: ${e.message}")
+            synchronized(lovedMbids) { lovedMbids.remove(mbid) }
+        }
+    }
 
     // --- Requests ---
 
@@ -325,7 +410,7 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput {
             withContext(Dispatchers.IO) {
                 http.newCall(req).execute().use { res ->
                     when {
-                        res.isSuccessful -> { lbLog("$type inviato (${listens.size})"); SendResult.OK }
+                        res.isSuccessful -> { lbLog("$type sent (${listens.size})"); SendResult.OK }
                         res.code == 401 || res.code == 429 || res.code >= 500 -> {
                             lbLog("$type da ritentare: HTTP ${res.code}"); SendResult.RETRY
                         }
