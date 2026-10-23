@@ -6,10 +6,7 @@ import dev.brahmkshatriya.echo.common.clients.TrackerMarkClient
 import dev.brahmkshatriya.echo.common.models.EchoMediaItem
 import dev.brahmkshatriya.echo.common.models.TrackDetails
 import dev.brahmkshatriya.echo.common.models.User
-import dev.brahmkshatriya.echo.common.settings.Setting
-import dev.brahmkshatriya.echo.common.settings.SettingSwitch
-import dev.brahmkshatriya.echo.common.settings.SettingTextInput
-import dev.brahmkshatriya.echo.common.settings.Settings
+import dev.brahmkshatriya.echo.common.settings.*
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -101,7 +98,7 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput, LikeCl
             "Auto-private listened tracks", KEY_PRIVATE,
             "Every track counted as listened is marked as private on ListenBrainz", false
         ),
-        SettingTextInput("API URL", KEY_API_URL, "Change only for compatible servers (self-hosted, Libre.fm...)", DEFAULT_API_URL)
+        SettingTextInput("API URL", KEY_API_URL, "Change only for compatible servers (self-hosted, Libre.fm...)", DEFAULT_API_URL),
     )
 
     override fun setSettings(settings: Settings) { this.settings = settings }
@@ -248,6 +245,8 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput, LikeCl
             put("artist_name", artist)
             put("track_name", t.title)
             t.album?.title?.takeIf { it.isNotBlank() }?.let { put("release_name", it) }
+            t.extras["mbid"]?.takeIf { it.isNotBlank() }?.let { put("recording_mbid", it) }
+            t.album?.extras?.get("mbid")?.takeIf { it.isNotBlank() }?.let { put("release_mbid", it) }
             putJsonObject("additional_info") {
                 put("media_player", "Echo")
                 put("submission_client", "Echo ListenBrainz extension")
@@ -274,24 +273,18 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput, LikeCl
     private fun dedupWindow() =
         (settings.getString(KEY_DEDUP_WINDOW)?.trim()?.toIntOrNull() ?: 0).coerceIn(0, 100)
 
-    private fun identityOf(d: TrackDetails): String {
-        fun n(s: String) = s.lowercase().filter { it.isLetterOrDigit() }
-        return n(d.track.artists.joinToString(",") { it.name }) + "|" + n(d.track.title)
-    }
-
     private fun isRepeat(d: TrackDetails): Boolean {
         val window = dedupWindow()
-        val id = identityOf(d)
+        val k = keyOf(d)
         synchronized(recentPlays) {
-            val repeat = window > 0 && recentPlays.takeLast(window).contains(id)
-            recentPlays.addLast(id)
+            val repeat = window > 0 && recentPlays.takeLast(window).contains(k)
+            recentPlays.addLast(k)
             while (recentPlays.size > 100) recentPlays.removeFirst()
             return repeat
         }
     }
 
     // --- Offline ---
-
     private fun ensureQueueLoaded() {
         val owner = currentUser?.id
         if (owner != null && queueOwner == owner) return
