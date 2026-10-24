@@ -114,7 +114,7 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput, LikeCl
 
     private fun autoLoveEnabled() = settings.getBoolean(KEY_AUTO_LOVE) ?: false
 
-    private fun autoPrivateEnabled() = settings.getBoolean(KEY_AUTO_LOVE) ?: false
+    private fun autoPrivateEnabled() = settings.getBoolean(KEY_PRIVATE) ?: false
 
 
     // --- Login---
@@ -235,7 +235,7 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput, LikeCl
         if (autoLoveEnabled()) scope.launch { autoLove(details) }
     }
 
-    // --- Costruzione dei dati ---
+    // --- Data preparation ---
 
     private fun trackMetadata(d: TrackDetails): JsonObject? {
         val t = d.track
@@ -355,7 +355,7 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput, LikeCl
                 withContext(Dispatchers.IO) {
                     http.newCall(Request.Builder().url(url).header("Authorization", "Token ${token.orEmpty()}").get().build()).execute().use {
                         val b = if (it.isSuccessful) it.body.string() else null
-                        lbLog("lookup HTTP ${it.code} per '$artist' - '${d.track.title}': ${b?.take(300)}")
+                        lbLog("lookup HTTP ${it.code} for '$artist' - '${d.track.title}': ${b?.take(300)}")
                         b
                     }
                 }
@@ -389,7 +389,7 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput, LikeCl
             withContext(Dispatchers.IO) {
                 http.newCall(req).execute().use { res ->
                     if (res.isSuccessful) lbLog("love sent: $mbid")
-                    else { lbLog("love fallito: HTTP ${res.code}"); synchronized(lovedMbids) { lovedMbids.remove(mbid) } }
+                    else { lbLog("love failed: HTTP ${res.code}"); synchronized(lovedMbids) { lovedMbids.remove(mbid) } }
                 }
             }
         } catch (e: Exception) {
@@ -416,14 +416,14 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput, LikeCl
                     when {
                         res.isSuccessful -> { lbLog("$type sent (${listens.size})"); SendResult.OK }
                         res.code == 401 || res.code == 429 || res.code >= 500 -> {
-                            lbLog("$type da ritentare: HTTP ${res.code}"); SendResult.RETRY
+                            lbLog("$type HTTP ${res.code}"); SendResult.RETRY
                         }
-                        else -> { lbLog("$type scartato: HTTP ${res.code} ${res.body.string()}"); SendResult.DROP }
+                        else -> { lbLog("$type HTTP ${res.code} ${res.body.string()}"); SendResult.DROP }
                     }
                 }
             }
         } catch (e: Exception) {
-            lbLog("$type errore di rete: ${e.message}")
+            lbLog("$type error ${e.message}")
             SendResult.RETRY
         }
     }
