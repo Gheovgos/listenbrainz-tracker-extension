@@ -43,6 +43,8 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput, LikeCl
 
         const val KEY_PRIVATE = "private"
 
+        const val KEY_RESOLVE = "resolve_mbid"
+
     }
 
     private enum class SendResult { OK, RETRY, DROP }
@@ -99,6 +101,12 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput, LikeCl
             "Every track counted as listened is marked as private on ListenBrainz", false
         ),
         SettingTextInput("API URL", KEY_API_URL, "Change only for compatible servers (self-hosted, Libre.fm...)", DEFAULT_API_URL),
+
+        SettingSwitch(
+            "Search MBIDs (MusicBrainz)", KEY_RESOLVE,
+            "Find the recording id before sending, so listens from other sources are linked right away",
+            true
+        ),
     )
 
     override fun setSettings(settings: Settings) { this.settings = settings }
@@ -115,6 +123,10 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput, LikeCl
     private fun autoLoveEnabled() = settings.getBoolean(KEY_AUTO_LOVE) ?: false
 
     private fun autoPrivateEnabled() = settings.getBoolean(KEY_PRIVATE) ?: false
+
+    private fun resolveEnabled() = settings.getBoolean(KEY_RESOLVE) ?: true
+
+    private val lookupHttp = http.newBuilder().callTimeout(4, java.util.concurrent.TimeUnit.SECONDS).build()
 
 
     // --- Login---
@@ -211,11 +223,13 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput, LikeCl
 
     override suspend fun onMarkAsPlayed(details: TrackDetails) {
         ensureTrack(details)
+        lbLog("listen: ext=${details.extensionId} id=${details.track.id} mbid=${details.track.extras["mbid"]} album=${details.track.album?.extras?.get("mbid")} queue=${pending.size}")
         if (isRepeat(details)) {
             lbLog("hiding repeat: ${details.track.title}")
             return
         }
-        val meta = trackMetadata(details) ?: run {
+        val found = if (details.track.extras["mbid"].isNullOrBlank() && resolveEnabled()) lookupMbid(details) else null
+        val meta = trackMetadata(details, found) ?: run {
             lbLog("skipped, missing data: ${details.track.title}")
             return
         }
@@ -232,27 +246,32 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput, LikeCl
             post("single", listOf(listen))
         }
         lbLog("onMarkAsPlayed: autolove=${autoLoveEnabled()} token=${token != null}")
-        if (autoLoveEnabled()) scope.launch { autoLove(details) }
+        if (autoLoveEnabled()) scope.launch { autoLove(details, found ?: details.track.extras["mbid"]) }
     }
 
     // --- Data preparation ---
 
-    private fun trackMetadata(d: TrackDetails): JsonObject? {
+    private fun trackMetadata(d: TrackDetails, mbid: String? = null): JsonObject? {
         val t = d.track
         val artist = t.artists.joinToString(", ") { it.name }.trim()
         if (artist.isEmpty() || t.title.isBlank()) return null
+        val recording = mbid ?: t.extras["mbid"]?.takeIf { it.isNotBlank() }
+        val albumMbid = t.album?.extras?.get("mbid")?.takeIf { it.isNotBlank() }
+        val isGroup = t.album?.extras?.get("kind") == "release-group"
+        val artistMbids = t.artists.mapNotNull { a -> a.extras["mbid"]?.takeIf { it.isNotBlank() } }
         return buildJsonObject {
             put("artist_name", artist)
             put("track_name", t.title)
             t.album?.title?.takeIf { it.isNotBlank() }?.let { put("release_name", it) }
-            t.extras["mbid"]?.takeIf { it.isNotBlank() }?.let { put("recording_mbid", it) }
-            t.album?.extras?.get("mbid")?.takeIf { it.isNotBlank() }?.let { put("release_mbid", it) }
             putJsonObject("additional_info") {
                 put("media_player", "Echo")
                 put("submission_client", "Echo ListenBrainz extension")
                 put("submission_client_version", "1.0")
                 (d.totalDuration ?: t.duration)?.let { put("duration_ms", it) }
                 t.isrc?.takeIf { it.isNotBlank() }?.let { put("isrc", it) }
+                recording?.let { put("recording_mbid", it) }
+                albumMbid?.let { put(if (isGroup) "release_group_mbid" else "release_mbid", it) }
+                if (artistMbids.isNotEmpty()) put("artist_mbids", JsonArray(artistMbids.map { JsonPrimitive(it) }))
             }
         }
     }
@@ -371,10 +390,10 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput, LikeCl
         return null
     }
 
-    private suspend fun autoLove(d: TrackDetails) {
+    private suspend fun autoLove(d: TrackDetails, known: String? = null) {
         lbLog("autolove: ${d.track.artists.joinToString { it.name }} - ${d.track.title}")
         val tk = token ?: return
-        val mbid = lookupMbid(d) ?: run {
+        val mbid = known ?: lookupMbid(d) ?: run {
             lbLog("love skipped (no MBID): ${d.track.title}")
             return
         }
@@ -387,7 +406,7 @@ class ListenBrainzExtension : TrackerMarkClient, LoginClient.CustomInput, LikeCl
             .build()
         try {
             withContext(Dispatchers.IO) {
-                http.newCall(req).execute().use { res ->
+                lookupHttp.newCall(req).execute().use { res ->
                     if (res.isSuccessful) lbLog("love sent: $mbid")
                     else { lbLog("love failed: HTTP ${res.code}"); synchronized(lovedMbids) { lovedMbids.remove(mbid) } }
                 }
